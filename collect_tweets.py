@@ -32,7 +32,8 @@ API_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
 KST = timezone(timedelta(hours=9))
 
 SHEET_TITLE = "시트테스트"      # 구글 시트 문서(스프레드시트) 이름 -- 단, 실제 접근은 SPREADSHEET_ID 로 함
-TAB_NAME = "트위터누적"          # 탭(워크시트) 이름
+TAB_NAME = "트위터누적"          # 본문 데이터 탭(워크시트) 이름
+SUMMARY_TAB_NAME = "일별집계"    # 날짜별 수집 개수를 기록하는 별도 탭 (본문 탭과 완전히 분리)
 
 HEADER = [
     "수집일(KST)",      # 이 트윗을 수집 대상으로 삼은 "어제" 날짜
@@ -177,10 +178,57 @@ def standardize_row(t: dict, collected_date_str: str) -> list:
     ]
 
 
-def get_worksheet():
-    sa_json = env_or_die("GOOGLE_SERVICE_ACCOUNT")
-    spreadsheet_id = env_or_die("SPREADSHEET_ID")
+def get_worksheet(gc, spreadsheet_id: str):
+    """본문 데이터 탭('트위터누적')을 가져오거나 없으면 생성."""
+    sh = gc.open_by_key(spreadsheet_id)
 
+    try:
+        ws = sh.worksheet(TAB_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=TAB_NAME, rows=1000, cols=len(HEADER))
+
+    # A1 셀을 기준으로 헤더 존재 여부 확인 (다른 열에 값이 있어도 영향 없음)
+    a1_value = ws.acell("A1").value
+    if not a1_value:
+        ws.update(f"A1:{chr(ord('A') + len(HEADER) - 1)}1", [HEADER])
+
+    return ws
+
+
+def get_summary_worksheet(gc, spreadsheet_id: str):
+    """집계 전용 탭('일별집계')을 가져오거나 없으면 생성. 본문 탭과 완전히 분리되어 서로 영향 없음."""
+    sh = gc.open_by_key(spreadsheet_id)
+
+    try:
+        ws = sh.worksheet(SUMMARY_TAB_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=SUMMARY_TAB_NAME, rows=1000, cols=2)
+
+    a1_value = ws.acell("A1").value
+    if not a1_value:
+        ws.update("A1:B1", [["날짜(KST)", "트윗 수집 개수"]])
+
+    return ws
+
+
+def append_rows(ws, rows: list[list]):
+    if not rows:
+        return
+    # table_range="A1"로 명시 -> 항상 A열 기준으로 데이터가 있는 마지막 줄 다음에 추가됨.
+    # (다른 열에 값이 있어도 A~K열 기준 위치만 보고 판단하므로 칼럼이 밀릴 일이 없음)
+    ws.append_rows(rows, value_input_option="USER_ENTERED", table_range="A1")
+
+
+def write_daily_count_summary(summary_ws, date_str: str, count: int):
+    """
+    집계 전용 탭의 A, B열에 '날짜 | 수집개수'를 한 줄씩 누적 기록.
+    본문 탭(트위터누적)과는 완전히 다른 탭이라 서로 영향을 주지 않음.
+    """
+    summary_ws.append_rows([[date_str, count]], value_input_option="USER_ENTERED", table_range="A1")
+
+
+def get_gspread_client():
+    sa_json = env_or_die("GOOGLE_SERVICE_ACCOUNT")
     try:
         creds_info = json.loads(sa_json)
     except json.JSONDecodeError:
@@ -189,50 +237,12 @@ def get_worksheet():
 
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-    gc = gspread.authorize(creds)
-
-    sh = gc.open_by_key(spreadsheet_id)
-
-    try:
-        ws = sh.worksheet(TAB_NAME)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=TAB_NAME, rows=1000, cols=len(HEADER) + 2)
-
-    # 헤더가 없으면(빈 시트) 헤더 작성
-    first_row = ws.row_values(1)
-    if not first_row:
-        ws.append_row(HEADER, value_input_option="USER_ENTERED")
-
-    return ws
-
-
-def append_rows(ws, rows: list[list]):
-    if not rows:
-        return
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
-
-
-def write_daily_count_summary(ws, date_str: str, count: int):
-    """
-    같은 탭의 우측 별도 영역(예: M, N열)에 '날짜 | 수집개수' 형태로 한 줄씩 누적 기록.
-    """
-    summary_col_a = "M"
-    summary_col_b = "N"
-
-    header_cell = ws.acell(f"{summary_col_a}1").value
-    if not header_cell:
-        ws.update(f"{summary_col_a}1:{summary_col_b}1", [["날짜(KST)", "트윗 수집 개수"]])
-
-    existing_dates = ws.col_values(13)  # M열 = 13번째
-    next_row = len(existing_dates) + 1
-    if next_row < 2:
-        next_row = 2
-
-    ws.update(f"{summary_col_a}{next_row}:{summary_col_b}{next_row}", [[date_str, count]])
+    return gspread.authorize(creds)
 
 
 def main():
     api_key = env_or_die("TWITTERAPI_IO_KEY")
+    spreadsheet_id = env_or_die("SPREADSHEET_ID")
     keyword = os.environ.get("SEARCH_KEYWORD", "생리대")
 
     day_start, day_end, date_str = get_target_day_kst()
@@ -247,9 +257,12 @@ def main():
 
     rows = [standardize_row(t, date_str) for t in tweets]
 
-    ws = get_worksheet()
+    gc = get_gspread_client()
+    ws = get_worksheet(gc, spreadsheet_id)
     append_rows(ws, rows)
-    write_daily_count_summary(ws, date_str, len(tweets))
+
+    summary_ws = get_summary_worksheet(gc, spreadsheet_id)
+    write_daily_count_summary(summary_ws, date_str, len(tweets))
 
     print("[DONE] 구글 시트 저장 완료")
 
