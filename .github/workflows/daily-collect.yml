@@ -30,3 +30,7 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SEARCH_KEYWORD: "생리대"
         run: python collect_tweets.py
+        
+name: Daily X Keyword Collector
+# schedule re-registered
+        
