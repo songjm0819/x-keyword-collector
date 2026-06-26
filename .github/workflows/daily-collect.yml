@@ -2,7 +2,7 @@ name: Daily X Keyword Collector
 
 on:
   schedule:
-    - cron: "26 7 * * *"
+    - cron: "0 22 * * *"
   workflow_dispatch: {}
 
 permissions:
