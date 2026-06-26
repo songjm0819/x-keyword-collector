@@ -1,0 +1,2 @@
+This file was created to trigger repository activity and enable scheduled workflows.
+Created: 2026-06-26
