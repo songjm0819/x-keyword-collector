@@ -97,17 +97,15 @@ def api_get(api_key: str, params: dict) -> dict:
     return {"tweets": []}
 
 
+
+
+
 def fetch_day_tweets(api_key: str, keyword: str, since_ts: int, until_ts: int) -> list[dict]:
-    """
-    [since_ts, until_ts] 구간의 트윗을 until_time 슬라이딩 방식으로 전부 수집.
-    - 한 번 호출에 최대 20개 반환 -> 가장 이른 트윗 시각 - 1초를 다음 until_time으로 사용
-    - 20개 미만 응답이면 해당 구간 종료
-    - 동일 구간에서 진행이 멈추면(이전 until_time과 동일) 무한루프 방지를 위해 종료
-    """
     collected = []
     seen_ids = set()
     current_until = until_ts
     calls = 0
+    empty_streak = 0  # 연속 빈 응답 카운터
 
     while current_until > since_ts and calls < MAX_CALLS_PER_WINDOW:
         query = f"{keyword} since_time:{since_ts} until_time:{current_until}"
@@ -116,19 +114,24 @@ def fetch_day_tweets(api_key: str, keyword: str, since_ts: int, until_ts: int) -
         calls += 1
 
         if not tweets:
-            break
+            empty_streak += 1
+            if empty_streak >= 3:
+                print(f"[INFO] 연속 빈 응답 3회 -> 수집 종료 (until={current_until})")
+                break
+            # 빈 응답이면 1시간 앞으로 슬라이딩해서 계속 탐색
+            current_until -= 3600
+            continue
 
-        new_in_batch = 0
+        empty_streak = 0
+
         for t in tweets:
             tid = t.get("id")
             if not tid or tid in seen_ids:
                 continue
-            # 일부 환경에서 -filter:retweets 가 완전히 걸러주지 않으므로 코드에서 한 번 더 확인
             if t.get("isRetweet", False):
                 continue
             seen_ids.add(tid)
             collected.append(t)
-            new_in_batch += 1
 
         try:
             earliest = min(parse_twitter_time(t["createdAt"]) for t in tweets)
@@ -138,13 +141,34 @@ def fetch_day_tweets(api_key: str, keyword: str, since_ts: int, until_ts: int) -
         if earliest < current_until:
             current_until = earliest - 1
         else:
-            # 더 이상 진행되지 않음 -> 무한루프 가능성, 종료
             break
 
-        if len(tweets) < 20:
-            break
+        # 20개 미만이어도 종료하지 않고 since_ts까지 계속 탐색
+        # (twitterapi.io가 특정 시간대에서 일시적으로 적게 반환해도 누락 없이 탐색)
 
+    print(f"[INFO] API 호출 횟수: {calls}회")
     return collected
+
+
+def get_existing_tweet_ids(ws, date_str: str) -> set:
+    """
+    시트에서 해당 날짜(date_str)에 이미 저장된 트윗ID를 읽어서 반환.
+    중복 수집 방지용 — 이미 있는 ID는 추가하지 않음.
+    """
+    try:
+        all_values = ws.get_all_values()
+        if len(all_values) <= 1:
+            return set()
+        existing_ids = set()
+        for row in all_values[1:]:  # 헤더 제외
+            if len(row) >= 3 and row[0] == date_str:
+                tid = row[2]  # C열 = 트윗ID
+                if tid:
+                    existing_ids.add(tid)
+        return existing_ids
+    except Exception as e:
+        print(f"[WARN] 기존 트윗ID 조회 실패: {e}", file=sys.stderr)
+        return set()
 
 
 def standardize_row(t: dict, collected_date_str: str) -> list:
@@ -255,10 +279,15 @@ def main():
     tweets = fetch_day_tweets(api_key, keyword, since_ts, until_ts)
     print(f"[INFO] 수집된 트윗 수: {len(tweets)}")
 
-    rows = [standardize_row(t, date_str) for t in tweets]
-
     gc = get_gspread_client()
     ws = get_worksheet(gc, spreadsheet_id)
+
+    # 중복 방지: 오늘 이미 저장된 트윗ID를 조회해서 새 트윗만 필터링
+    existing_ids = get_existing_tweet_ids(ws, date_str)
+    new_tweets = [t for t in tweets if t.get("id") not in existing_ids]
+    print(f"[INFO] 이미 저장된 트윗: {len(existing_ids)}개, 새로 추가할 트윗: {len(new_tweets)}개")
+
+    rows = [standardize_row(t, date_str) for t in new_tweets]
     append_rows(ws, rows)
 
     summary_ws = get_summary_worksheet(gc, spreadsheet_id)
@@ -269,3 +298,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
